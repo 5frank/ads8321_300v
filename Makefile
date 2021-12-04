@@ -143,7 +143,7 @@ flash: hex
 	@echo -n
 
 install: hex
-	avrdude -p m328p -c arduino -b 57600 -P /dev/ttyUSB1 \
+	avrdude -p m328p -c arduino -b 57600 -P /dev/ttyUSB0 \
 	-U flash:w:$(BUILDDIR)$(TARGET).hex
 
 fuse:

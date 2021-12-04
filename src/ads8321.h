@@ -5,69 +5,113 @@
 #include <stdint.h>
 #include "gpio.h"
 
+// IO pins inverted (inverted isolation)
+#define ADC8321_PINS_INVERTED 1
 // PORT, PIN
-#define ADS8321_PIN_CS   D,4
-#define ADS8321_PIN_CLK  D,4
-#define ADS8321_PIN_DATA  D,3
+#define ADS8321_PIN_CS    D,4 // arduino "D4"
+#define ADS8321_PIN_CLK   D,3 // arduino "D3"
+#define ADS8321_PIN_DATA  D,2 // arduino "D2"
 // TOOD use min clock_time
-#define ADS8321_CLK_USEC 1000
+#define ADS8321_CLK_USEC 8000
 
 static inline void ads8321_init(void) 
 {
     GPIO_OUTPUT(ADS8321_PIN_CS, 1);
     GPIO_OUTPUT(ADS8321_PIN_CLK, 1);
-    GPIO_INPUT(ADS8321_PIN_DATA, false);
+    GPIO_INPUT(ADS8321_PIN_DATA, 0);
 }
+
+static inline void ads8321_pin_cs_set(uint8_t state) 
+{
+#if ADC8321_PINS_INVERTED
+    state = !state;
+#endif
+    GPIO_WRITE(ADS8321_PIN_CS, state);
+}
+
+static inline void ads8321_pin_clk_set(uint8_t state) 
+{
+#if ADC8321_PINS_INVERTED
+    state = !state;
+#endif
+    GPIO_WRITE(ADS8321_PIN_CLK, state);
+}
+
+static inline uint8_t ads8321_pin_data_get(void) 
+{
+    uint8_t val = GPIO_READ(ADS8321_PIN_DATA);
+#if ADC8321_PINS_INVERTED
+    return !val;
+#else
+    return !!val;
+#endif
+}
+
 
 static inline uint8_t ads8321_clock_pulse_read(void) 
 {
-        GPIO_WRITE(ADS8321_PIN_CLK, 0);
+    ads8321_pin_clk_set(0);
+    _delay_us(ADS8321_CLK_USEC / 2);
 
-        _delay_us(ADS8321_CLK_USEC / 2);
+    ads8321_pin_clk_set(1);
 
-        GPIO_WRITE(ADS8321_PIN_CLK, 1);
-        // Use positive clock edge to read data pin
-        uint8_t val = GPIO_READ(ADS8321_PIN_DATA);
+    // Use positive clock edge to read data pin
+    uint8_t val = ads8321_pin_data_get();
 
-       _delay_us(ADS8321_CLK_USEC / 2); 
+   _delay_us(ADS8321_CLK_USEC / 2); 
 
-       return val ? 1 : 0;
+   return val;
 }
 /**
 Minimum 22 clock cycles required for 16-bit conversion. 
 not that if CS remains LOW at the end of conversion, a new datastream with
 LSB-first is shifted out again.
 */
-static inline uint16_t ads8321_blocking_read(void) 
+
+union ads8321_sample_u {
+    uint16_t u16;
+    int16_t s16;
+    uint8_t u8[2];
+};
+
+static inline int16_t ads8321_blocking_read(void) 
 {
+    uint8_t bit = 0;
     // aussume ADS8321_PIN_CLK already HIGH here
     _delay_us(1);
 
-    GPIO_WRITE(ADS8321_PIN_CS, 0);
-    _delay_us(20); // needed?
+    ads8321_pin_cs_set(0);
 
     /* The first 4.5 to 5.0 clock periods of the conversion cycle areused to
      * sample the input signal */
-    uint8_t bit = 0;
-    for (uint8_t i = 0; i < 7; i++) {
-        bit = ads8321_clock_pulse_read();
-        if (bit == 0) {
-            break;
+    uint8_t start_sig = 0;
+    for (uint8_t i = 0; i < 5; i++) {
+        if (ads8321_clock_pulse_read() == 0) {
+            start_sig = 1;
         }
     }
-
-    uint16_t sample = 0;
-    const uint8_t nbits = sizeof(sample) * CHAR_BIT;
-    for (uint8_t i = 0; i < nbits; i++) {
-
-        bit = ads8321_clock_pulse_read();
-        sample |= bit;
-        sample <<= 1;
+    if (!start_sig) {
+        // sanity check
+        return -1;
     }
 
-    GPIO_WRITE(ADS8321_PIN_CS, 1);
+    uint16_t data = 0;
+    const uint8_t nbits = sizeof(data) * CHAR_BIT;
+    for (uint8_t i = 0; i < nbits; i++) {
+        bit = ads8321_clock_pulse_read();
+        data |= bit;
+        data <<= 1;
+    }
 
-    return sample;
+    ads8321_pin_cs_set(1);
+    // "power down". unclear if needed
+    for (uint8_t i = 0; i < 10; i++) {
+        bit = ads8321_clock_pulse_read();
+        (void) bit;
+    }
+
+    union ads8321_sample_u sample = { .u16 = data };
+    return sample.s16;
 }
 
 enum ads8321_state_e {
@@ -88,7 +132,7 @@ struct ads8321_data {
 static void ads8321_clk_tick_update(struct ads8321_data *ctx)
 {
     if (ctx->state == ADS8321_STATE_START) {
-        GPIO_WRITE(ADS8321_PIN_CS, 0);
+        ads8321_pin_cs_set(0);
         ctx->rising = 0;
         ctx->count = 0;
         ctx->state = ADS8321_STATE_WAIT;
@@ -98,7 +142,7 @@ static void ads8321_clk_tick_update(struct ads8321_data *ctx)
     // ensure clock stay high first time after STATE_START
     ctx->rising = !ctx->rising;
 
-    GPIO_WRITE(ADS8321_PIN_CLK, ctx->rising);
+    ads8321_pin_clk_set(ctx->rising);
 
     if (!ctx->rising) {
         // falling clock edge - nothing more to do on 
@@ -106,8 +150,7 @@ static void ads8321_clk_tick_update(struct ads8321_data *ctx)
     }
 
     // Use rising clock edge to read data pin. MSB first
-    uint8_t bit = GPIO_READ(ADS8321_PIN_DATA) ? 1 : 0;
-
+    uint8_t bit = ads8321_pin_data_get();
     /* wait for DATA_PIN LOW, which indicates sample is ready and will start on
      * next rising clock edge..
      * Minimum 22 clock cycles required for 16-bit conversion. */
@@ -129,7 +172,7 @@ static void ads8321_clk_tick_update(struct ads8321_data *ctx)
             ctx->count++;
         }
         else {
-            GPIO_WRITE(ADS8321_PIN_CS, 1);
+            ads8321_pin_cs_set(1);
             // prepare next state
             ctx->count = 0;
             ctx->state = ADS8321_STATE_DONE;
