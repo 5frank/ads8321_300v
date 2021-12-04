@@ -48,36 +48,6 @@ static void main_init(void)
 
     sei();
 }
-/**
- * raw == 124 == +10V
- * raw == 62 == +5V
- * raw == -1980 == -10V
- */ 
-static int16_t convert_sample(uint16_t data) 
-{
-    int16_t val;
-
-#if 1
-    const uint16_t zero_offs = 1 << 15;
-    if (data > zero_offs) {
-        val = data - zero_offs;
-    }
-    else {
-        val = -((int16_t)(data - zero_offs));
-    }
-
-#else
-    const uint16_t msb = 1 << 15;
-    if (data & msb) {
-        data &= ~msb;
-        val =  ((int16_t)data);
-    } else {
-        data &= ~msb;
-        val =  -((int16_t)data);
-    }
-#endif
-    return val;
-}
 
 static void print_s16(int16_t sample)
 {
